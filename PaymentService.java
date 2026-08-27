@@ -17,8 +17,4 @@ public void retryPayment() {
 public void validatePayment() {
     System.out.println("Payment validated");
 }
-
-public void processRefund() {
-    System.out.println("Refund processed");
-}
 }
