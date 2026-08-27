@@ -14,4 +14,7 @@ public class PaymentService {
 public void retryPayment() {
     System.out.println("Retrying payment");
 }
+public void validatePayment() {
+    System.out.println("Payment validated");
+}
 }
