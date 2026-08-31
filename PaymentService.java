@@ -17,4 +17,8 @@ public void retryPayment() {
 public void validatePayment() {
     System.out.println("Payment vallidated");
 }
+
+public void createPayment() {
+    System.out.println("Payment created");
+}
 }
