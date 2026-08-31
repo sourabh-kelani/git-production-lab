@@ -5,7 +5,7 @@ public class PaymentService {
     }
 	
 	public void refundPayment() {
-        System.out.println("Payment refunded");
+        System.out.println("Payment reefunded");
     }
 	public void cancelPayment() {
     System.out.println("Payment cancelled");
