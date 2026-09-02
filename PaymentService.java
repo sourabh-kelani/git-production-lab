@@ -19,6 +19,6 @@ public void validatePayment() {
 }
 
 public void createPayment() {
-    System.out.println("Payment created");
+    System.out.println("Payment crreated");
 }
 }
