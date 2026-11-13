@@ -177,12 +177,14 @@ Each environment has its own copy, so prod rows hold prod URLs.
 `icm_bureau_master`
 ```
 bureau_code STRING, bureau_name STRING, adapter_code STRING, auth_type STRING,
-secret_scope STRING, secret_keys STRING (JSON of key NAMES), is_active BOOLEAN, audit columns
+is_active BOOLEAN, audit columns
 ```
 `icm_company_bureau`
 ```
 company_id STRING, bureau_code STRING, enabled BOOLEAN,
 concurrency_limit INT, threads_per_partition INT (default 10),
+secret_scope STRING,                 -- Key Vault-backed scope (per env; per company if isolated)
+secret_keys STRING,                  -- JSON of secret key NAMES for THIS company's bureau account
 circuit_breaker_threshold INT (default 20), audit columns
 ```
 `icm_bureau_request_step` — ordered API calls INSIDE a bureau
@@ -284,6 +286,23 @@ On failure the failing step is logged and NO later step rows are written for tha
 - Only a config-admin group can write config tables (Unity Catalog grants); job is read-only.
 - `main_validate_config`: renders every template with sample data, checks JSON/XML well-formedness, required placeholders, secret key names, and registry class — run before activating.
 - Config changes via reviewed SQL scripts in `config/sql/`. `config_version` stored on every bronze row.
+
+## 10.1 Credentials management
+- All bureau credentials (client IDs/secrets, API keys, usernames/passwords, mTLS certificates) are stored in **Azure Key Vault**, exposed to Databricks via a **Key Vault-backed secret scope**.
+- **One Key Vault + secret scope per environment** (dev/uat/prod); prod credentials are never reachable from lower environments.
+- Config tables store only `secret_scope` and secret **key names**. Never store secret values in Delta tables, YAML, code, Git, job parameters, widgets, or job environment variables.
+- **Credentials must NOT be stored in any database table — not even encrypted.** Reasons: Delta time travel retains old values until VACUUM; values leak via SELECT access, clones, backups, dev copies and query history; table reads are not audited like Key Vault reads; no native rotation/expiry; encryption would still need a key in Key Vault, adding custom crypto with no security gain. Do not generate code, DDL, or columns that hold secret values.
+- **Split of responsibility:** DB = *which* secret to use (scope + key names per company/bureau); Key Vault = the secret *values*.
+- **Company onboarding (credentials):** (1) add the company's bureau secrets to Key Vault using the naming convention; (2) insert key names into `icm_company_bureau`; (3) run `main_validate_config`, which checks every referenced key exists in the scope (without reading/printing values).
+- **Credentials are per company + bureau** (each company has its own bureau account). Mapping lives in `icm_company_bureau.secret_scope` / `secret_keys`, never in `icm_bureau_master`.
+- Naming convention: `<bureau>-<company_id>-<item>` (e.g. `experian-c001-client-secret`).
+- A job run handles one `company_id`, so only that company's secrets are loaded; a run must never resolve another company's secrets.
+- Companies needing strict isolation get their own Key Vault + secret scope — only `secret_scope` changes, no code change.
+- The job runs as a **service principal** with read-only access to secrets; only an admin group can create/update them.
+- `jobs/secrets.py` resolves required keys ONCE on the driver per bureau task, fails fast with a clear error (key name only, never the value) if any is missing, and passes them to partitions in memory only.
+- mTLS certs: read from Key Vault, written at runtime to temp files with `0600` permissions, deleted after the partition finishes.
+- Never log, print, or include secrets/tokens in exceptions, StepResults, or bronze rows. Add a test that fails if a secret value appears in log output.
+- Rotation is operational (Key Vault expiry/rotation); since secrets are read at job start, rotation needs no code change. Key Vault diagnostic logging is enabled for audit (infra team).
 
 ## 11. Code standards
 - Python 3.10+, full type hints, `abc.ABC` + `@abstractmethod`, `typing.final` on template/common methods; run mypy.
