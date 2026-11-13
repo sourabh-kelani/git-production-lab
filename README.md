@@ -57,6 +57,8 @@ icm-bureau/
 │       ├── main_finalize.py            # Task 3
 │       ├── main_validate_config.py     # config validation utility
 │       ├── config_repo.py              # reads config tables (ONLY used by prepare/validate)
+│       ├── table_names.py              # fixed table name constants
+│       ├── table_resolver.py           # catalog.schema.table resolution per company
 │       ├── snapshot.py                 # write/load run config snapshot + customer snapshot
 │       ├── secrets.py                  # resolves secrets on the DRIVER via dbutils.secrets
 │       ├── runner.py                   # BureauRunner: concurrency, idempotency, circuit breaker
@@ -174,6 +176,24 @@ class ExperianBureau(JsonBureau):
 ## 5. Config tables (Delta, Unity Catalog)
 Each environment has its own copy, so prod rows hold prod URLs.
 
+### 5.1 Table resolution (multi-client schemas)
+- Unity Catalog 3-level names: `<catalog>.<schema>.<table>`.
+  - **catalog** = environment, from Asset Bundle variable per target (e.g. `icm_dev`, `icm_uat`, `icm_prod`).
+  - **schema** = `icm_company.data_schema` for the company (client data), or the shared config schema (bundle variable, e.g. `icm_config`) for config tables.
+  - **table** = fixed names defined ONCE as constants in `jobs/table_names.py`: `silver_icm_cust_rvw`, `silver_icm_cust_rvw_hist`, `bronze_raw_bureau_response`, customer details table (TODO: ask me), config table names.
+- Client data tables (review, hist, bronze, customer details) live in the company's `data_schema`: e.g. `icm_prod.client_c001.silver_icm_cust_rvw`.
+- `jobs/table_resolver.py` → `TableResolver(catalog, config_schema, company)` with methods `review()`, `review_hist()`, `bronze()`, `customer()`, `config(name)`. **All table access goes through it** — no f-string table names anywhere else.
+- Validate catalog/schema/table identifiers against `^[A-Za-z0-9_]+$` and quote with backticks before use in SQL (config values reach SQL — prevent injection/typos).
+- Task 1 resolves all names, verifies each table exists, and stores the fully qualified names in the run snapshot; Tasks 2/3 use the snapshot (no second lookup).
+- ADF passes only `company_id` and `run_id`; never pass schema/table names as job parameters.
+
+`icm_company` — company registry (ONLY these columns)
+```
+company_id STRING (PK), company_name STRING, client_id STRING, data_schema STRING
+```
+- `data_schema` = the Unity Catalog schema holding that company's data tables.
+- Read ONCE in Task 1 for the job's `company_id`; fail fast if the row is missing.
+
 `icm_bureau_master`
 ```
 bureau_code STRING, bureau_name STRING, adapter_code STRING, auth_type STRING,
@@ -205,7 +225,8 @@ version INT, is_active BOOLEAN, effective_from TIMESTAMP, audit columns
 Source app → ADF → silver_icm_cust_rvw (run_id = batch id)
 ADF "Databricks Job" activity → job params: company_id, run_id
 
-Task 1  prepare          → read ALL config for company_id ONCE; validate; check registry
+Task 1  prepare          → read icm_company for company_id → resolve data_schema + table names (§5.1)
+                           → read ALL config for company_id ONCE; validate; check registry
                            → write config snapshot: /Volumes/<cat>/<schema>/icm_runs/<run_id>/config_snapshot.json (+ config_version hash)
                            → build customer snapshot ONCE (silver_icm_cust_rvw join customer details → canonical model)
                            → publish enabled bureau_codes as task value
