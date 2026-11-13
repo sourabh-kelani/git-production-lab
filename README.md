@@ -1,229 +1,305 @@
-# Copilot Instructions — ICM Bureau Fetch Framework
+# Copilot Instructions — ICM Bureau Fetch (base package + bureau adapters + Databricks job)
 
 ## Role
-You are a senior data/backend engineer building a production-grade, config-driven credit bureau integration framework on Databricks (Python/PySpark). Follow fintech best practices: security, idempotency, auditability, testability, and extensibility. Explain design trade-offs briefly when you make one.
+You are a senior Python/data engineer building a production-grade credit bureau integration for Databricks. Follow fintech best practices: security, idempotency, auditability, testability, extensibility. Use clean OOP (Template Method + Adapter + Registry patterns). Explain design trade-offs briefly when you make one.
 
 ---
 
 ## 1. Business context
-- Project: **ICM module** — automated credit review.
-- Overall pipeline: `bureau_fetch → scoring → credit_limit`. **My scope is only `bureau_fetch`.**
-- A source application holds customers due for credit review. It serves multiple clients, each identified by `company_id`. For now assume **one client / one company_id**, but the design must be multi-client from day one.
+- Project: **ICM module** — automated credit review. Pipeline: `bureau_fetch → scoring → credit_limit`. **My scope is only `bureau_fetch`.**
+- A source application holds customers due for review. It serves multiple clients, each identified by `company_id`. For now assume **one company_id**, but design for multi-client from day one.
 - Volume: ~150k customers/day.
-- Each client has its own set of configured bureaus (current client: Experian, Equifax, TransUnion). **New bureaus will be added in future — adding one must require config + template only, no engine code changes** (except for a genuinely new auth type or unusual behaviour).
-- Bureaus differ in: base URL, HTTP method, authentication (OAuth2 client credentials / API key / basic auth / mTLS), request format (JSON or XML), response format, and allowed concurrency.
+- Each company has its own list of configured bureaus (current: Experian, Equifax, TransUnion). New bureaus will be added later.
+- Bureaus differ in authentication, URLs, request format (JSON/XML), and may need **several API calls in a fixed sequence** (e.g. 1 = token → 2 = submit inquiry → 3 = fetch report).
 
-## 2. End-to-end flow
+## 2. Design principle: code = behaviour, DB = values
+| In the Python package (code) | In Databricks config tables (DB) |
+|---|---|
+| Base classes, common logic, each bureau's implementation | Company → bureaus, enabled flag |
+| Concurrency, retry, circuit breaker, storage (runner) | URLs, headers & request body templates, call sequence |
+| Registry: bureau → implementation class | Concurrency limit, timeouts, retry counts |
+| | Secret **key names** (never secret values) |
+
+- URL / request changes in prod = config change, **no deployment**.
+- A brand-new bureau = new adapter class (deploy) + config rows. A simple REST bureau may use `GenericRestBureau` and need **no new class**.
+
+## 3. Repository layout (two layers in one repo)
 ```
-Source app → ADF → silver_icm_cust_rvw (one row per customer review; run_id = batch id)
-ADF "Databricks Job" activity triggers the job with params: company_id, run_id
-  Task 1  prepare          → read enabled bureaus for company_id; publish list as task value
-  Task 2  for_each bureau  → bureau_fetch(bureau_code, company_id, run_id)
-                             [parallel; writes ONLY to bronze_raw_bureau_response]
-  Task 3  bureau_finalize  → per review: decide Bureau step pass/fail,
-                             append to silver_icm_cust_rvw_hist, update silver_icm_cust_rvw on failure
-  Task 4  scoring (out of scope; must process only reviews whose Bureau step passed)
+icm-bureau/
+├── pyproject.toml                      # builds ONE wheel: icm_bureau
+├── databricks.yml                      # Asset Bundle: job (prepare → for_each bureau → finalize), targets dev/uat/prod
+├── config/sql/                         # DDL for config tables + reviewed config insert scripts
+├── src/icm_bureau/
+│   ├── core/                           # PURE PYTHON — must NEVER import pyspark/dbutils
+│   │   ├── models.py                   # CanonicalCustomer, ReviewRef, BureauConfig, RequestStep, StepResult, BureauResult, Status
+│   │   ├── exceptions.py               # BureauError, RetryableError, PermanentError, ConfigError, TemplateError
+│   │   ├── template_engine.py          # sandboxed Jinja2, filters, secret(), compile cache
+│   │   ├── extractor.py                # JSONPath / XPath extraction
+│   │   ├── http_client.py              # session factory, timeouts, retry (tenacity), mTLS
+│   │   ├── auth/
+│   │   │   ├── base.py                 # AuthStrategy (abstract)
+│   │   │   ├── oauth2_client_credentials.py
+│   │   │   ├── api_key.py
+│   │   │   ├── basic.py
+│   │   │   └── mtls.py
+│   │   ├── bureaus/
+│   │   │   ├── base.py                 # BaseBureau (abstract, template method)
+│   │   │   ├── json_bureau.py          # JsonBureau(BaseBureau) – common JSON behaviour
+│   │   │   ├── xml_bureau.py           # XmlBureau(BaseBureau)  – common XML behaviour
+│   │   │   ├── generic_rest.py         # GenericRestBureau – fully config-driven
+│   │   │   ├── experian.py             # ExperianBureau(JsonBureau)
+│   │   │   ├── equifax.py              # EquifaxBureau(JsonBureau)
+│   │   │   └── transunion.py           # TransUnionBureau(XmlBureau)
+│   │   └── registry.py                 # @register_bureau("EXPERIAN"), get_bureau_class()
+│   └── jobs/                           # DATABRICKS LAYER — Spark, dbutils, Delta I/O
+│       ├── main_prepare.py             # Task 1
+│       ├── main_fetch.py               # Task 2 (per bureau): --bureau-code --company-id --run-id
+│       ├── main_finalize.py            # Task 3
+│       ├── main_validate_config.py     # config validation utility
+│       ├── config_repo.py              # reads config tables (ONLY used by prepare/validate)
+│       ├── snapshot.py                 # write/load run config snapshot + customer snapshot
+│       ├── secrets.py                  # resolves secrets on the DRIVER via dbutils.secrets
+│       ├── runner.py                   # BureauRunner: concurrency, idempotency, circuit breaker
+│       ├── storage.py                  # bronze MERGE, run summary
+│       └── review_repo.py              # silver_icm_cust_rvw + hist (finalize only)
+└── tests/
+    ├── core/                           # fast unit tests, no Spark
+    └── jobs/                           # runner/storage tests (local Spark or mocks)
 ```
-- Parallel bureau tasks must NOT write to the silver review tables. Only `bureau_finalize` (a single task) writes there, to avoid concurrent Delta write conflicts and partial step results.
-- Use a Databricks **For each** task iterating over the bureau list from Task 1 (`dbutils.jobs.taskValues.set`). Adding a bureau to config must automatically include it in the run without changing the job definition.
-- Each bureau run must respect that bureau's `concurrency_limit` (max simultaneous HTTP calls).
-- One bureau failing must not fail or block the other bureaus.
+- `core` must be unit-testable on a laptop with no Spark. Enforce: add a test that fails if any `core` module imports `pyspark` or `dbutils`.
 
-## 3. Configuration design (hybrid)
-| What | Where | Why |
-|---|---|---|
-| Client → bureau mapping, enabled flag, concurrency_limit | Delta table `icm_config.client_bureau` | Business-changeable without deployment; Delta time travel = audit history |
-| Bureau definition: URL, method, format, auth type, timeouts, retry policy, field mapping | YAML in Git: `config/bureaus/<bureau_code>.yaml` | Versioned, code-reviewed, tested, deployed per environment |
-| Request body | Jinja2 template in Git: `config/templates/<bureau_code>.<json|xml>.j2` | Testable before production |
-| Environment-specific values (base URLs) | Databricks Asset Bundle variables per target (dev/uat/prod), referenced as `${VAR}` in YAML | No env values hardcoded |
-| Credentials | Databricks secret scope (Key Vault-backed) | YAML holds only secret key NAMES, never values |
+## 4. Class design (most important section)
 
-### 3.1 `client_bureau` table
+### 4.1 Rules
+1. **Abstract whenever possible:** anything that genuinely differs per bureau is an `@abstractmethod` that each bureau MUST implement explicitly.
+2. **Common whenever possible:** anything that is the same for all bureaus lives ONCE in a base class as a concrete method. Never copy-paste logic into bureau classes.
+3. **Template Method:** the orchestration method (`fetch`) is defined in `BaseBureau`, marked `@typing.final`, and must NOT be overridden. Bureaus customise behaviour only through abstract methods and optional hooks.
+4. Bureau classes are **stateless per customer**, receive config + secrets via constructor, never read the DB, never use Spark/dbutils, never log PII.
+5. Shared behaviour by format goes in intermediate abstract classes (`JsonBureau`, `XmlBureau`); shared auth goes in `AuthStrategy` implementations (composition, not inheritance).
+
+### 4.2 `AuthStrategy` (core/auth/base.py)
+```python
+class AuthStrategy(ABC):
+    def __init__(self, config: dict, secrets: dict): ...
+    @abstractmethod
+    def authenticate(self, session) -> None: ...          # obtain token/credentials
+    @abstractmethod
+    def apply(self, request: PreparedRequest) -> PreparedRequest: ...  # add headers / certs
+    def is_expired(self) -> bool: ...                     # COMMON: expiry check with safety margin (default 60s)
+    def ensure_valid(self, session) -> None: ...          # COMMON: thread-safe (lock) re-auth if expired
+    def invalidate(self) -> None: ...                     # COMMON: force re-auth (used on 401)
+```
+Implementations: `OAuth2ClientCredentialsAuth`, `ApiKeyAuth`, `BasicAuth`, `MtlsAuth`. Selected from config (`auth_type`) via a factory. One instance per partition; token shared across threads with a lock.
+
+### 4.3 `BaseBureau` (core/bureaus/base.py)
+```python
+class BaseBureau(ABC):
+    def __init__(self, config: BureauConfig, auth: AuthStrategy, http: HttpClient,
+                 templates: TemplateEngine): ...
+
+    # ---------- ABSTRACT: every bureau must implement ----------
+    @property
+    @abstractmethod
+    def bureau_code(self) -> str: ...
+
+    @abstractmethod
+    def required_fields(self) -> list[str]: ...
+        # canonical customer fields this bureau needs (validated before any paid call)
+
+    @abstractmethod
+    def build_context(self, customer: CanonicalCustomer, review: ReviewRef) -> dict: ...
+        # bureau-specific formatting of customer data for templates (date formats, name split, address codes)
+
+    @abstractmethod
+    def serialize_body(self, rendered_body: str) -> bytes: ...
+        # implemented in JsonBureau / XmlBureau (validate well-formedness, encoding)
+
+    @abstractmethod
+    def parse_payload(self, response) -> Any: ...
+        # implemented in JsonBureau (json) / XmlBureau (lxml)
+
+    @abstractmethod
+    def extract_reference_id(self, step: RequestStep, payload: Any) -> str | None: ...
+        # bureau's own request/report id for audit
+
+    # ---------- COMMON: template method — DO NOT OVERRIDE ----------
+    @final
+    def fetch(self, customer: CanonicalCustomer, review: ReviewRef, session) -> BureauResult:
+        # 1. validate_customer → 2. build_context → 3. ensure auth
+        # 4. for step in steps sorted by sequence: execute_step; stop chain on first failure
+        # 5. return BureauResult (SUCCESS only if LAST step returned HTTP 200)
+
+    # ---------- COMMON: concrete, shared by all bureaus ----------
+    @final
+    def validate_customer(self, customer) -> None: ...      # uses required_fields(); missing → PermanentError
+    @final
+    def execute_step(self, step, ctx, session) -> StepResult: ...  # render → apply auth → send → classify → extract
+    def render_url(self, step, ctx) -> str: ...
+    def render_headers(self, step, ctx) -> dict: ...
+    def render_body(self, step, ctx) -> str | None: ...
+    def send(self, request, step, session): ...             # retry via http_client using step's retry config
+    def is_success(self, response) -> bool: ...             # HTTP 200 == success (project rule)
+    def is_retryable(self, response_or_exc) -> bool: ...    # timeouts, conn errors, step.retry_on_status
+    def extract_values(self, step, payload) -> dict: ...    # applies step.extract (JSONPath/XPath) into ctx
+    def to_step_result(self, step, request_ts, response, error) -> StepResult: ...
+
+    # ---------- HOOKS: optional override, default no-op ----------
+    def before_step(self, step, ctx) -> None: ...
+    def after_step(self, step, ctx, result: StepResult) -> None: ...
+```
+- 401 handling (COMMON in `execute_step`): `auth.invalidate()` → `auth.ensure_valid()` → retry once.
+- `fetch` and `execute_step` must catch all exceptions and convert them into `StepResult` / `BureauResult` with `FAILED_RETRYABLE` or `FAILED_PERMANENT` — a bureau must never crash the partition.
+
+### 4.4 Format bases (common per format, still abstract)
+- `JsonBureau(BaseBureau)`: implements `serialize_body` (json.loads to validate, UTF-8), `parse_payload` (json), JSONPath extraction. Leaves `bureau_code`, `required_fields`, `build_context`, `extract_reference_id` abstract.
+- `XmlBureau(BaseBureau)`: implements `serialize_body` (lxml parse to validate), `parse_payload` (lxml, secure parser: no external entities), XPath extraction. Same abstract methods left open.
+
+### 4.5 Concrete bureaus
+```python
+@register_bureau("EXPERIAN")
+class ExperianBureau(JsonBureau):
+    bureau_code = "EXPERIAN"
+    def required_fields(self): ...
+    def build_context(self, customer, review): ...
+    def extract_reference_id(self, step, payload): ...
+```
+- Concrete classes contain ONLY bureau-specific logic. If you find yourself writing the same code in two bureau classes, move it to a base class.
+- `GenericRestBureau(BaseBureau)`: config-driven; `build_context` exposes canonical fields as-is; format chosen from config. Use for simple bureaus that need no custom code.
+
+### 4.6 Registry
+- `@register_bureau(code)` decorator; `get_bureau_class(adapter_code)` raises `ConfigError` if unknown.
+- `icm_bureau_master.adapter_code` selects the class (e.g. `EXPERIAN`, `GENERIC_REST`).
+- Task 1 validates that every enabled bureau has a registered class — fail early and clearly.
+
+## 5. Config tables (Delta, Unity Catalog)
+Each environment has its own copy, so prod rows hold prod URLs.
+
+`icm_bureau_master`
+```
+bureau_code STRING, bureau_name STRING, adapter_code STRING, auth_type STRING,
+secret_scope STRING, secret_keys STRING (JSON of key NAMES), is_active BOOLEAN, audit columns
+```
+`icm_company_bureau`
 ```
 company_id STRING, bureau_code STRING, enabled BOOLEAN,
-concurrency_limit INT, priority INT, created_at TIMESTAMP, updated_by STRING
+concurrency_limit INT, threads_per_partition INT (default 10),
+circuit_breaker_threshold INT (default 20), audit columns
 ```
-
-### 3.2 Bureau YAML example (`config/bureaus/experian.yaml`)
-```yaml
-code: EXPERIAN
-url: ${EXPERIAN_BASE_URL}/consumerservices/credit-profile/v2/credit-report
-method: POST
-format: json                       # json | xml
-headers:
-  Content-Type: application/json
-  Accept: application/json
-auth:
-  type: oauth2_client_credentials  # oauth2_client_credentials | api_key | basic | mtls
-  token_url: ${EXPERIAN_BASE_URL}/oauth2/v1/token
-  secret_scope: icm-bureau
-  secret_keys: { client_id: experian-client-id, client_secret: experian-client-secret }
-template: templates/experian.json.j2
-request_schema: schemas/experian_request.schema.json   # optional; XSD for XML bureaus
-field_mapping:                     # template variable ← canonical customer field (+ optional filters)
-  first_name: customer.first_name
-  last_name: customer.last_name
-  ssn: customer.national_id
-  dob: customer.dob | date('%m%d%Y')
-  zip: customer.address.postal_code
-timeout: { connect_sec: 10, read_sec: 30 }
-retry:
-  max_attempts: 3
-  backoff: { initial_sec: 1, max_sec: 30, jitter: true }
-  retry_on_status: [429, 500, 502, 503, 504]
-response:
-  reference_id_path: $.requestId   # JSONPath (or XPath for XML)
-custom_adapter: null               # optional escape hatch: "bureau_fetch.adapters.custom.MyAdapter"
+`icm_bureau_request_step` — ordered API calls INSIDE a bureau
 ```
-
-### 3.3 Template examples
-JSON (`templates/experian.json.j2`) — always use `| tojson` for values:
-```jinja
-{
-  "consumerPii": {
-    "primaryApplicant": {
-      "name": { "firstName": {{ first_name | tojson }}, "lastName": {{ last_name | tojson }} },
-      "ssn": { "ssn": {{ ssn | tojson }} },
-      "dob": { "dob": {{ dob | tojson }} }
-    }
-  }
-}
+company_id STRING, bureau_code STRING, sequence INT, step_name STRING,
+url_template STRING, http_method STRING, headers_template STRING (JSON),
+body_template STRING, request_format STRING, response_format STRING,
+extract STRING (JSON: {"var": "<JSONPath/XPath>"}), store_response BOOLEAN,
+connect_timeout_sec INT, read_timeout_sec INT, max_retries INT, retry_on_status STRING,
+version INT, is_active BOOLEAN, effective_from TIMESTAMP, audit columns
 ```
-XML (`templates/transunion.xml.j2`) — render with autoescape enabled:
-```jinja
-<creditBureau>
-  <subject><firstName>{{ first_name }}</firstName><lastName>{{ last_name }}</lastName></subject>
-</creditBureau>
+- Audit columns: `created_by INT, created_on TIMESTAMP, modified_by INT, modified_on TIMESTAMP`.
+- `sequence` orders calls within one bureau only. **Bureaus themselves run in parallel.**
+- Authentication is handled by `AuthStrategy` (from `auth_type`), not as a step row. Token URL etc. go in `icm_bureau_master` or a JSON `auth_config` column (ask me).
+
+## 6. Databricks job flow
 ```
+Source app → ADF → silver_icm_cust_rvw (run_id = batch id)
+ADF "Databricks Job" activity → job params: company_id, run_id
 
-## 4. Request building (dynamic)
-1. Normalise every client's input into ONE **canonical customer model** (`CanonicalCustomer` dataclass/pydantic). Templates map only from this model, never from client-specific columns.
-2. Resolve `field_mapping` → build template context. Support custom filters: `date(fmt)`, `upper`, `digits_only`, `mask`, `default(value)`.
-3. Render with a sandboxed Jinja2 environment (`StrictUndefined` so missing fields fail loudly; autoescape for XML).
-4. Validate rendered body against `request_schema` (JSON Schema / XSD) if configured — fail as `FAILED_PERMANENT` with a clear error, before making a paid call.
-5. Template rendering and validation must be unit-testable without any HTTP.
-
-## 5. Authentication (pluggable)
-- `AuthHandler` interface: `apply(request) -> request`, `refresh()`.
-- Implementations: `OAuth2ClientCredentialsAuth` (token cache, refresh ~60s before expiry, thread-safe), `ApiKeyAuth` (header or query param), `BasicAuth`, `MtlsAuth` (cert + key from secret scope written to a temp file with restricted permissions, cleaned up after).
-- `AuthFactory` selects handler by `auth.type`. New bureau with an existing auth type = zero code.
-- Secrets read only via `dbutils.secrets.get`. Never log secrets, tokens, or PII.
-
-## 6. Execution engine
-- Read reviews from `silver_icm_cust_rvw` where `run_id = :run_id` (see §8.1), join to the customer details source needed for bureau requests (name, DOB, address, ID — TODO: ask me which table) → map to canonical model.
-- Skip already-successful records (idempotency, see §7).
-- `df.repartition(concurrency_limit).mapPartitions(process_partition)`:
-  - One `requests.Session` (connection pooling) + one auth handler per partition.
-  - Explicit connect/read timeouts on every call.
-- Each partition returns result rows; driver writes them to Delta via MERGE.
-- Generic `HttpBureauClient` handles: render → validate → auth → send → classify → result. If `custom_adapter` is set, load that class (must subclass `BaseBureauAdapter`) and let it override specific hooks (`build_body`, `parse_reference_id`, `is_retryable`).
-
-## 7. Retry, idempotency, resilience
-- Use `tenacity` with exponential backoff + jitter, config-driven.
-- Retry ONLY on: timeouts, connection errors, and statuses in `retry_on_status`. Honour `Retry-After`.
-- Do NOT retry other 4xx. On 401: refresh token once, retry once.
-- **Idempotency:** bureau calls cost money. Before calling, skip any `(review_id, bureau_code)` that already has `SUCCESS` in `bronze_raw_bureau_response`. Job reruns must only process non-SUCCESS rows.
-- **Circuit breaker** per partition: after N consecutive failures (config, default 20), stop calling and mark remaining rows `FAILED_RETRYABLE` with reason `CIRCUIT_OPEN`.
-- Status values: `PENDING | SUCCESS | FAILED_RETRYABLE | FAILED_PERMANENT`.
-
-## 8. Storage (Delta, Unity Catalog)
-Table `bronze_raw_bureau_response` (all bureau responses are saved here; if this table already exists with a defined schema, use that schema — ask me for it — and map the fields below onto it):
+Task 1  prepare          → read ALL config for company_id ONCE; validate; check registry
+                           → write config snapshot: /Volumes/<cat>/<schema>/icm_runs/<run_id>/config_snapshot.json (+ config_version hash)
+                           → build customer snapshot ONCE (silver_icm_cust_rvw join customer details → canonical model)
+                           → publish enabled bureau_codes as task value
+Task 2  for_each bureau  → main_fetch(bureau_code)  [PARALLEL; writes ONLY bronze_raw_bureau_response]
+Task 3  bureau_finalize  → per review: Bureau step pass/fail → hist + review table
+Task 4  scoring          (out of scope)
 ```
-review_id, custno, run_id, company_id, bureau_code,
+- Config tables are read ONCE per job (Task 1). Bureau tasks read only the snapshot, ONCE, on the driver. **Never query config per customer or per partition.** Mid-run config changes don't affect a running job.
+- Customer details source table: TODO — ask me.
+
+## 7. `BureauRunner` (jobs/runner.py) — honours concurrency
+```python
+class BureauRunner:
+    def __init__(self, bureau_code, config_snapshot, secrets, storage): ...
+    def run(self, customers_df) -> RunSummary: ...
+```
+- **Decision: synchronous HTTP (`requests`) + threads. Do NOT use asyncio/aiohttp/httpx-async.** Bureau concurrency limits (tens of calls) cap throughput equally for threads and async, so async adds complexity (async-everywhere base classes, event loop inside Spark, blocking-call stalls) with no gain at this scale. All HTTP goes through the `HttpClient` abstraction so the transport can be swapped later without touching bureau classes.
+- **Concurrency is enforced ONLY by the runner, never inside bureau classes.**
+- Model: `partitions × threads_per_partition = concurrency_limit`.
+  - `partitions = ceil(concurrency_limit / threads_per_partition)`; `customers_df.repartition(partitions).mapPartitions(...)`.
+  - Inside each partition: `ThreadPoolExecutor(max_workers=threads_per_partition)`.
+  - HTTP calls are I/O-bound, so threads give real concurrency without needing one CPU core per call.
+- Per partition: build `AuthStrategy`, `TemplateEngine` (templates compiled once), `HttpClient`, and the bureau instance from the registry using the broadcast config + secrets. Use a **thread-local `requests.Session`** (sessions are not safely shareable across threads); share the auth token via the strategy's lock.
+- Secrets: resolve ONCE on the driver (`dbutils.secrets` is unavailable on executors), pass into the partition function. Never log or persist them.
+- Idempotency: before calling, anti-join out `(review_id, bureau_code)` that already have a final-step `SUCCESS` in bronze.
+- Circuit breaker (shared per partition): after `circuit_breaker_threshold` consecutive failures, stop calling and mark remaining customers `FAILED_RETRYABLE` with `CIRCUIT_OPEN`.
+- Returns step results as rows → driver writes via `storage.merge_bronze()`.
+- Document in code: all bureau tasks share the job cluster, so cluster size must cover the SUM of bureau concurrency.
+
+## 8. Retry rules (common, in http_client / BaseBureau)
+- tenacity, exponential backoff + jitter; per-step `max_retries` and `retry_on_status`.
+- Retry ONLY timeouts, connection errors, and configured statuses (default 429, 500, 502, 503, 504). Honour `Retry-After`.
+- No retry on other 4xx. 401 → re-auth once, retry once.
+- **HTTP 200 = SUCCESS.** Do not inspect payloads for business errors in this stage.
+
+## 9. Storage
+
+### 9.1 `bronze_raw_bureau_response` — one row per step call where `store_response = true`
+```
+review_id, custno, run_id, company_id, bureau_code, sequence, step_name,
 request_ts, response_ts, latency_ms, http_status, attempt_count,
-status, error_code, error_message, bureau_reference_id,
-response_format, raw_response STRING, config_version STRING
+status (SUCCESS | FAILED_RETRYABLE | FAILED_PERMANENT), error_code, error_message,
+bureau_reference_id, response_format, raw_response STRING, is_final_step BOOLEAN, config_version STRING
 ```
-- MERGE key: `(review_id, bureau_code)`. Partition/cluster by `bureau_code` and always include `bureau_code` in the MERGE condition so parallel bureau tasks don't conflict.
-- **Always write a row for every bureau call, whatever the outcome.** Store `raw_response` for failed calls too (4xx/5xx error bodies, bureau error/no-hit payloads), exactly as received. If no response was received (timeout, connection error, circuit open, request validation failure), store `raw_response = NULL` and populate `status`, `error_code`, `error_message`, `http_status` (NULL if none). Never drop a failed call silently.
-- **Success rule: HTTP 200 = `SUCCESS`.** Do not inspect the payload for business errors in this stage; any HTTP 200 response is stored as `SUCCESS` with its raw body. Any non-200 outcome is a failure (`FAILED_RETRYABLE` or `FAILED_PERMANENT` per §7).
-- Store `config_version` (Git commit / bundle version) for audit.
-- Do NOT store request bodies containing PII unless masked.
-- Parsing to a canonical silver table is OUT OF SCOPE now; keep `raw_response` unmodified.
-- Write a per-bureau run summary row to `icm_audit.bureau_run_summary` (counts by status, avg latency, start/end).
+- **Always write a row for every stored step call, success or failure.** Store failed response bodies exactly as received. No response (timeout, connection error, circuit open, validation/template error) → `raw_response = NULL` with status and error details.
+- Never store tokens, secrets, or request bodies with PII.
+- MERGE key `(review_id, bureau_code, sequence)`; cluster by `bureau_code` and include it in the MERGE condition so parallel tasks don't conflict.
+- If the existing table schema differs, ask me and map onto it.
+- Per-bureau run summary → `icm_audit.bureau_run_summary`.
 
-### 8.1 Existing review tables (already defined — do NOT change their schemas)
-`silver_icm_cust_rvw` — one row per customer review (current state):
+### 9.2 Existing review tables (do NOT change schemas)
+`silver_icm_cust_rvw` — one row per review:
 ```
-review_id STRING NOT NULL (PK), custno STRING NOT NULL, run_id STRING (batch id),
+review_id STRING NOT NULL (PK), custno STRING NOT NULL, run_id STRING,
 rvw_type TINYINT (0 = Scheduled, 1 = OnDemand),
 rvw_status TINYINT (0 = Passed, 1 = Failed — confirm other codes with me),
 failed_step TINYINT (1 = Bureau, 2 = Scoring, 3 = CreditLimit),
 exception_category TINYINT (codes TBD — ask me), exception_notes STRING, resolution_note STRING,
-arrival_at TIMESTAMP, action_at TIMESTAMP,
-created_on TIMESTAMP, modified_on TIMESTAMP, created_by INT, modified_by INT
+arrival_at TIMESTAMP, action_at TIMESTAMP, created_on TIMESTAMP, modified_on TIMESTAMP,
+created_by INT, modified_by INT
 ```
-`silver_icm_cust_rvw_hist` — PER-STEP audit, PERMANENT, APPEND-ONLY (never update/delete):
+`silver_icm_cust_rvw_hist` — per-step audit, PERMANENT, APPEND-ONLY:
 ```
 log_id BIGINT GENERATED ALWAYS AS IDENTITY (PK), review_id STRING NOT NULL, custno STRING NOT NULL,
 run_id STRING, rvw_type TINYINT, step TINYINT NOT NULL (1 = Bureau, 2 = Scoring, 3 = CreditLimit),
 step_status TINYINT (0 = Passed, 1 = Failed), exception_notes STRING, resolution_note STRING,
 arrival_at TIMESTAMP, action_at TIMESTAMP, created_on TIMESTAMP, created_by INT
 ```
-Rule from the table design: on failure the failing step is logged and NO later step rows are written for that review.
+On failure the failing step is logged and NO later step rows are written for that review.
 
-### 8.2 `bureau_finalize` task rules
-- Per-bureau call details live ONLY in `bronze_raw_bureau_response`. The hist table gets ONE row per review for step = 1 (Bureau), not one row per bureau call.
-- For each review in the run, after all bureau tasks finish:
-  - Bureau step PASSED (step_status = 0) only if every bureau enabled for the company_id is `SUCCESS` for that review_id.
-  - Otherwise FAILED (step_status = 1); `exception_notes` lists failed bureau codes + error codes (no PII, no raw responses).
-- Append the step = 1 row to `silver_icm_cust_rvw_hist` (never insert `log_id`; it is an identity column). Set `action_at` = when the step was processed, `created_on` = current_timestamp().
-- On failure: MERGE into `silver_icm_cust_rvw` by `review_id` setting `rvw_status = 1`, `failed_step = 1`, `exception_category`, `exception_notes`, `action_at`, `modified_on`, `modified_by`.
-- Do not write rows for steps 2/3 — scoring must pick only reviews with a passed step = 1 row and no failure.
-- Make finalize idempotent on rerun: do not append a duplicate step = 1 row for a (review_id, run_id) that already has one with the same outcome; ask me how reruns/retries of a failed review should be recorded.
-- `created_by` / `modified_by` are INT — ask me which system user id the job should use.
+### 9.3 `bureau_finalize` (single task, only writer of silver tables)
+- ONE hist row per review for `step = 1`. PASSED only if every enabled bureau has a final-step `SUCCESS`; else FAILED with `exception_notes` = failed bureau codes, step_name, error codes (no PII/raw responses).
+- Append hist (never insert `log_id`). On failure MERGE `silver_icm_cust_rvw`: `rvw_status = 1`, `failed_step = 1`, `exception_category`, `exception_notes`, `action_at`, `modified_on`, `modified_by`.
+- Idempotent on rerun; ask me how retries of failed reviews should be recorded and which INT user id the job uses.
 
-## 9. Observability
-- Structured JSON logging with run_id, batch_id, bureau_code, customer_id (no PII, no bodies).
-- Fail the bureau task (non-zero exit) only if failure rate exceeds a configurable threshold, so alerts fire on systemic issues but a few bad records don't block scoring.
-
-## 10. Project structure
-```
-bureau-fetch/
-├── databricks.yml                     # Asset Bundle: job, for_each task, targets dev/uat/prod
-├── pyproject.toml
-├── config/
-│   ├── bureaus/  experian.yaml  equifax.yaml  transunion.yaml
-│   ├── templates/ experian.json.j2  equifax.json.j2  transunion.xml.j2
-│   └── schemas/
-├── src/bureau_fetch/
-│   ├── main_prepare.py                # Task 1 entry: publish bureau list
-│   ├── main_fetch.py                  # Task 2 entry: --bureau-code --company-id --run-id
-│   ├── main_finalize.py               # Task 3 entry: --company-id --run-id
-│   ├── review_repo.py                 # reads silver_icm_cust_rvw; writes hist + failure updates
-│   ├── models.py                      # CanonicalCustomer, BureauConfig, CallResult, Status
-│   ├── config_loader.py               # YAML + env var substitution + validation (pydantic)
-│   ├── client_config_repo.py          # reads client_bureau table
-│   ├── request_builder.py             # field mapping, Jinja env, filters, schema validation
-│   ├── auth/  base.py  oauth2.py  api_key.py  basic.py  mtls.py  factory.py
-│   ├── http_client.py                 # HttpBureauClient, retry, circuit breaker
-│   ├── adapters/ base.py  registry.py
-│   ├── engine.py                      # partition processing, idempotency filter
-│   ├── storage.py                     # MERGE writes, run summary
-│   └── logging_utils.py
-└── tests/
-    ├── test_request_builder.py        # JSON + XML rendering, missing fields, filters
-    ├── test_auth.py                   # token caching/refresh, 401 handling
-    ├── test_http_client.py            # retry rules, Retry-After, no retry on 400, circuit breaker
-    ├── test_engine.py                 # idempotent skip, status mapping
-    └── fixtures/                      # sample bureau responses
-```
+## 10. Config governance (prod changes without deployment)
+- Never UPDATE active step rows in place: insert new `version`, switch `is_active`; rollback = switch back.
+- Only a config-admin group can write config tables (Unity Catalog grants); job is read-only.
+- `main_validate_config`: renders every template with sample data, checks JSON/XML well-formedness, required placeholders, secret key names, and registry class — run before activating.
+- Config changes via reviewed SQL scripts in `config/sql/`. `config_version` stored on every bronze row.
 
 ## 11. Code standards
-- Python 3.10+, type hints everywhere, pydantic for config validation (fail fast on bad YAML at job start).
-- Small, single-responsibility modules; no business logic in entry-point files.
-- pytest; mock HTTP with `responses`; no real bureau calls in tests.
-- No notebooks for core logic. Package as a wheel; run via `python_wheel_task`.
+- Python 3.10+, full type hints, `abc.ABC` + `@abstractmethod`, `typing.final` on template/common methods; run mypy.
+- pydantic models for config (fail fast in Task 1).
+- Structured JSON logging with run_id, bureau_code, sequence, review_id — no PII, bodies, tokens.
+- pytest; HTTP mocked with `responses`; no real bureau calls in tests.
+- Required tests: abstract classes cannot be instantiated; each concrete bureau implements all abstract methods; `fetch` stops chain on failure; 200 = success; retry/no-retry rules; 401 re-auth; template rendering JSON/XML/URL/headers; StrictUndefined errors; registry unknown code; runner concurrency math; idempotent skip; circuit breaker; finalize pass/fail; `core` has no pyspark import.
+- Package as a wheel; Databricks tasks use `python_wheel_task`. No notebooks for core logic.
 
-## 12. Adding a new bureau (must stay this simple)
-1. Add `config/bureaus/<code>.yaml` + template (+ optional schema) + a rendering test.
-2. Add credentials to the secret scope.
-3. Insert a row into `client_bureau` for the company_id.
-Code is needed only for a new auth type or a `custom_adapter`.
+## 12. Adding a new bureau
+1. If it needs custom logic: add `core/bureaus/<name>.py` extending `JsonBureau`/`XmlBureau`, implement only the abstract methods, register it, add tests. Otherwise use `GenericRestBureau`.
+2. Insert config rows (master, company_bureau, request_step) via reviewed SQL script.
+3. Add secrets. Run `main_validate_config`. Activate.
 
 ## 13. How to work with me
-1. First propose the detailed design (interfaces + data models) and WAIT for my confirmation.
-2. Implement incrementally in this order: models → config_loader → request_builder (+tests) → auth (+tests) → http_client (+tests) → engine → storage → entry points → databricks.yml.
-3. Implement Experian fully as the reference bureau; create Equifax/TransUnion configs with TODOs.
-4. **Never invent bureau API details** (endpoints, field names, auth flows). Ask me for the API spec / sample request & response, or leave clearly marked TODOs.
-5. After each step, list what was done and what's next.
+1. First propose the detailed design (class diagram, abstract vs common methods, data models, config DDL) and WAIT for my confirmation.
+2. Implement incrementally: models + exceptions → auth strategies → template_engine + extractor → http_client → BaseBureau → JsonBureau/XmlBureau → ExperianBureau (reference) → registry → runner → storage → prepare/fetch/finalize entry points → databricks.yml. Tests with each step.
+3. **Never invent bureau API details** (endpoints, field names, auth flows). Ask me for specs/samples or leave clearly marked TODOs.
+4. After each step, list what was done and what's next.
